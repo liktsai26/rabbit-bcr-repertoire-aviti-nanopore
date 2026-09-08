@@ -19,7 +19,6 @@ All analysis was run in a single conda environment (`bcr_pipeline`) to keep
 versions consistent across every step. See `docs/` for the full version
 record:
 
-- `docs/Analysis_Environment_Versions.docx` — detailed working record (Chinese)
 - `docs/Software_and_Computational_Environment.docx` — Methods-ready paragraph + Table S1 (English)
 - `environment.yml` — machine-readable export (`conda env export --no-builds`), recreate with:
   ```
