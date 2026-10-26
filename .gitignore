@@ -1,0 +1,5 @@
+# test environment, downloaded public data, simulations and sandbox runs (tests/README.md)
+work/
+__pycache__/
+*.pyc
+.pytest_cache/

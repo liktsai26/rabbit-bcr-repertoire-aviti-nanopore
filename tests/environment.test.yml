@@ -1,0 +1,21 @@
+# Minimal, solvable environment used for the review tests (macOS arm64 and x86_64).
+# The repository's environment.yml is a full `conda env export` that does not solve as-is
+# (sqlite=3.51.2 conflicts with libsqlite>=3.52 required by igblast 1.22.0; several
+# defaults-channel builds are rejected under strict channel priority), and it lacks chopper.
+#   conda env create -p work/env -f tests/environment.test.yml
+name: bcr_review_test
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.10
+  - igblast=1.22.0
+  - blast=2.16.0
+  - cutadapt=5.2
+  - chopper=0.14.1
+  - nanofilt=2.8.0
+  - biopython=1.87
+  - pandas=2.3.3
+  - numpy=2.2.6
+  - pytest
+  - pyflakes

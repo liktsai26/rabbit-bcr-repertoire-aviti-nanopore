@@ -1,4 +1,11 @@
 #!/bin/bash
+# 2026-10 code review 修正：
+#   - cutadapt 加 -n 2：原本 -g TSO 與 -a RC(primer) 同時給、但預設每條read只剪一個adapter，
+#     兩端都有adapter的read只會剪掉其中一端（實測：保留5'端TSO＋前段序列）。
+#   - igblast 驗證/切半重跑改用 igblast_chunk_lib.sh（igblastn 非0結束不再直接中止、
+#     無法處理的read ID 寫到 <sample>_irrecoverable_ids.txt）。
+#   - QC 統計百分比在0筆時不再出錯。
+#   注意：README/方法學文件寫的是 NanoFilt 2.8.0，實際使用的是 chopper（版本見 log）。
 IGDATA="${BCR_IGDATA:-/Users/newuser/Desktop/claude-code/0-Environment/miniforge3/envs/igblast-env/share/igblast}"
 PYTHON="${BCR_PIPELINE_PYTHON:-/Users/newuser/Desktop/claude-code/0-Environment/miniforge3/envs/igblast-env/bin/python}"
 BASE_DIR="${BCR_PIPELINE_ROOT:-/Users/newuser/Desktop/claude-code/20260701-BCR_pipeline}"
@@ -58,72 +65,9 @@ command -v cutadapt &>/dev/null || error "找不到 cutadapt"
 mkdir -p "$OUT_DIR"
 info "IGDATA：$IGDATA"
 info "igblastn：$($IGBLASTN -version 2>&1 | head -1)"
+info "chopper：$(chopper --version 2>&1 | head -1)；cutadapt：$(cutadapt --version 2>&1)"
 
-split_fasta() {
-    awk -v batch="$3" -v prefix="$2" '
-    /^>/ {
-        if (n % batch == 0) {
-            if (fi > 0) close(outfile)
-            outfile = sprintf("%s_%04d.fasta", prefix, fi)
-            fi++
-        }
-        n++
-    }
-    { print > outfile }
-    ' "$1"
-}
-
-# igblastn 1.22.0 已知問題：單次呼叫累積處理夠多序列後會對特定序列丟出
-# CEXCEPTION(NULL pointer)，該序列之後排隊的部分被靜默丟棄且exit code仍是0
-# （2026-09-17 於 AVITI IGK/IGL 實測發現）。這裡核對輸入輸出行數，對不上就切半
-# 重跑，保證不再靜默漏資料。Nanopore單一樣本讀數不多，通常一次就會過。
-igblast_verified() {
-    local FASTA="$1" OUT="$2"
-    local N_IN
-    N_IN=$(grep -c "^>" "$FASTA")
-    local TMP_OUT="${OUT}.attempt"
-
-    IGDATA="$IGDATA" BLASTDB="$BLASTDB" "$IGBLASTN" "${IGBLAST_ARGS[@]}" \
-        -query "$FASTA" -out "$TMP_OUT" 2>/dev/null
-
-    local N_OUT
-    N_OUT=$(tail -n +2 "$TMP_OUT" 2>/dev/null | wc -l | tr -d ' ')
-
-    if [ "${N_OUT:-0}" -eq "$N_IN" ]; then
-        mv "$TMP_OUT" "$OUT"
-        return
-    fi
-
-    if [ "$N_IN" -le 1 ]; then
-        warn "  無法處理的序列（igblastn持續失敗），記錄為缺失並跳過：$(grep '^>' "$FASTA")"
-        mv "$TMP_OUT" "$OUT"
-        return
-    fi
-
-    warn "  批次驗證失敗（輸入${N_IN}條，輸出${N_OUT:-0}條），切半重跑：$(basename "$FASTA")"
-    local HALF=$(( (N_IN + 1) / 2 ))
-    local SPLIT_DIR
-    SPLIT_DIR=$(mktemp -d "$(dirname "$FASTA")/retry.XXXXXX")
-    split_fasta "$FASTA" "${SPLIT_DIR}/part" "$HALF"
-
-    local MERGED="${OUT}.merged"
-    : > "$MERGED"
-    local FIRST=1
-    shopt -s nullglob
-    for HALF_FASTA in "${SPLIT_DIR}"/part_*.fasta; do
-        local HALF_OUT="${HALF_FASTA}.airr.tsv"
-        igblast_verified "$HALF_FASTA" "$HALF_OUT"
-        if [ "$FIRST" = "1" ]; then
-            cat "$HALF_OUT" >> "$MERGED"
-            FIRST=0
-        else
-            tail -n +2 "$HALF_OUT" >> "$MERGED"
-        fi
-    done
-    rm -rf "$SPLIT_DIR"
-    mv "$MERGED" "$OUT"
-    rm -f "$TMP_OUT"
-}
+source "${SCRIPT_DIR}/igblast_chunk_lib.sh"
 
 run_nano_chain() {
     local CHAIN="$1" LOCUS="$2" FASTQ="$3" LEN_MIN="$4" GROUP="$5"
@@ -134,19 +78,24 @@ run_nano_chain() {
     mkdir -p "$SDIR"
 
     step "處理 ${SAMPLE}"
-    if [ -f "${SDIR}/${SAMPLE}_igblast.airr.tsv" ]; then
+    [ -f "$FASTQ" ] || error "找不到：$FASTQ"
+    # 2026-10：除了結果檔存在，還要求輸入檔指紋（檔名、大小、第一筆/最後一筆read名稱）相同才跳過；
+    # 同一樣本名換過輸入檔（例如重定序）時原本會直接沿用舊結果。
+    local FP; FP="$(basename "$FASTQ")	$(wc -c < "$FASTQ" | tr -d ' ')	$(head -1 "$FASTQ")	$(tail -n 4 "$FASTQ" | head -1)"
+    if [ -f "${SDIR}/${SAMPLE}_igblast.airr.tsv" ] && [ -f "${SDIR}/input.fingerprint" ] \
+        && [ "$(cat "${SDIR}/input.fingerprint")" = "$FP" ]; then
         info "${SAMPLE} 先前已完成，跳過"
         return
     fi
-    [ -f "$FASTQ" ] || error "找不到：$FASTQ"
     local RAW; RAW=$(count_reads "$FASTQ")
     info "  Raw reads：${RAW}"
 
     info "Step 1/4 — chopper (-q 10, ${LEN_MIN}–${LEN_MAX} bp)"
     local QC="${SDIR}/${CHAIN}_qc.fastq"
-    chopper -q 10 -l "$LEN_MIN" --maxlength "$LEN_MAX" < "$FASTQ" > "$QC"
+    # -t 1：chopper 預設多執行緒，輸出順序每次不同；單執行緒保持輸入順序，結果可重現
+    chopper -t 1 -q 10 -l "$LEN_MIN" --maxlength "$LEN_MAX" < "$FASTQ" > "$QC"
     local QC_N; QC_N=$(count_reads "$QC")
-    info "  After QC：${QC_N} ($("$PYTHON" -c "print(f'{${QC_N}/${RAW}*100:.1f}%')"))"
+    info "  After QC：${QC_N} ($("$PYTHON" -c "print(f'{${QC_N}/${RAW}*100:.1f}%' if ${RAW} else 'n/a')"))"
 
     info "Step 2/4 — Adapter Trim (-e 0.1, --revcomp)"
     local TRIM="${SDIR}/${CHAIN}_trimmed.fastq"
@@ -154,11 +103,11 @@ run_nano_chain() {
     for REV in "${REV_PRIMERS[@]}"; do
         CA_ARGS+=(-a "$(rc_iupac "$REV")")
     done
-    CA_ARGS+=(--revcomp -e 0.1 --overlap 15 --discard-untrimmed
+    CA_ARGS+=(-n 2 --revcomp -e 0.1 --overlap 15 --discard-untrimmed
               --minimum-length "$LEN_MIN" --maximum-length "$LEN_MAX" --quiet)
     cutadapt "${CA_ARGS[@]}" "$QC" -o "$TRIM"
     local TRIM_N; TRIM_N=$(count_reads "$TRIM")
-    info "  After trim：${TRIM_N} ($("$PYTHON" -c "print(f'{${TRIM_N}/${QC_N}*100:.1f}%')"))"
+    info "  After trim：${TRIM_N} ($("$PYTHON" -c "print(f'{${TRIM_N}/${QC_N}*100:.1f}%' if ${QC_N} else 'n/a')"))"
 
     info "Step 3/4 — FASTQ → FASTA"
     local FASTA="${SDIR}/${CHAIN}_trimmed.fasta"
@@ -175,23 +124,25 @@ run_nano_chain() {
 
     if [ "$LOCUS" = "IGH" ]; then
         IGBLAST_ARGS+=(
-            -germline_db_V "${IMGT}/IGHV.fasta"
-            -germline_db_D "${IMGT}/IGHD.fasta"
-            -germline_db_J "${IMGT}/IGHJ.fasta"
+            -germline_db_V "\"${IMGT}/IGHV.fasta\""
+            -germline_db_D "\"${IMGT}/IGHD.fasta\""
+            -germline_db_J "\"${IMGT}/IGHJ.fasta\""
             -min_D_match 5)
     elif [ "$LOCUS" = "IGK" ]; then
         IGBLAST_ARGS+=(
-            -germline_db_V "${IMGT}/IGKV.fasta"
-            -germline_db_D "${IMGT}/IGKJ.fasta"
-            -germline_db_J "${IMGT}/IGKJ.fasta")
+            -germline_db_V "\"${IMGT}/IGKV.fasta\""
+            -germline_db_D "\"${IMGT}/IGKJ.fasta\""
+            -germline_db_J "\"${IMGT}/IGKJ.fasta\"")
     elif [ "$LOCUS" = "IGL" ]; then
         IGBLAST_ARGS+=(
-            -germline_db_V "${IMGT}/IGLV.fasta"
-            -germline_db_D "${IMGT}/IGLJ.fasta"
-            -germline_db_J "${IMGT}/IGLJ.fasta")
+            -germline_db_V "\"${IMGT}/IGLV.fasta\""
+            -germline_db_D "\"${IMGT}/IGLJ.fasta\""
+            -germline_db_J "\"${IMGT}/IGLJ.fasta\"")
     fi
 
-    igblast_verified "$FASTA" "$AIRR"
+    local IGBLAST_STDERR_LOG="${SDIR}/igblastn_stderr.log"
+    rm -f "${SDIR}/${SAMPLE}_irrecoverable_ids.txt"
+    igblast_verified "$FASTA" "$AIRR" "${SDIR}/${SAMPLE}_irrecoverable_ids.txt"
 
     local IGBLAST_N
     IGBLAST_N=$(tail -n +2 "$AIRR" | wc -l | tr -d ' ')
@@ -205,6 +156,7 @@ with open('${SDIR}/${SAMPLE}_qc_stats.json','w') as f:
                'reads_raw':${RAW},'reads_qc':${QC_N},
                'reads_trimmed':${TRIM_N},'reads_igblast':${IGBLAST_N}}, f, indent=2)
 "
+    echo "$FP" > "${SDIR}/input.fingerprint"
     info "✓ ${SAMPLE} 完成"
 }
 
@@ -218,4 +170,5 @@ run_nano_chain "IGL"  "IGL" "$IMMU_IGL_FASTQ" "$LEN_MIN_IGL" "Immu" "$IGL_REV1" 
 echo -e "\n${GREEN}============================================${NC}"
 echo -e "${GREEN}  Nanopore pipeline 完成！輸出：${OUT_DIR}${NC}"
 echo -e "${GREEN}============================================${NC}"
+shopt -u nullglob
 ls -lh "${OUT_DIR}"/MZPD8T_*/*.airr.tsv 2>/dev/null || true

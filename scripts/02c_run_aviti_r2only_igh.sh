@@ -28,20 +28,24 @@
 #
 # 中斷後重跑：已完成的 chunk 會被跳過（chunks/chunk_XXX.done 標記），
 # 只會繼續處理尚未完成的部分，不會整個重跑。
+# 2026-10 code review 修正：路徑可用 BCR_* 環境變數覆寫；sed 讀到該 chunk 結尾就停（原本每個
+# chunk 都把整個 FASTQ 從頭讀到尾）；記錄輸入檔指紋，輸入換了卻沿用舊的 .done 時停下來；
+# chunk_stats.csv 同一 chunk 重跑時取代舊列；結尾統計在0筆時不再因 grep -c 回傳1而失敗。
 # ============================================================
 
 RABBIT="$1"
 [ -z "$RABBIT" ] && { echo "用法：bash 02c_run_aviti_r2only_igh.sh <rabbit_number>"; exit 1; }
 
-BASE_DIR="/Users/newuser/Desktop/claude-code/20260701-BCR_pipeline"
+BASE_DIR="${BCR_PIPELINE_ROOT:-/Users/newuser/Desktop/claude-code/20260701-BCR_pipeline}"
+ENV_PREFIX="${BCR_ENV_PREFIX:-/Users/newuser/Desktop/claude-code/0-Environment/miniforge3/envs/igblast-env}"
 R1="${BASE_DIR}/samples/15651-LT-${RABBIT}_R1.fastq"
 R2="${BASE_DIR}/samples/15651-LT-${RABBIT}_R2.fastq"
 OUT_DIR="${BASE_DIR}/results/15651-LT-${RABBIT}_Aviti24/IGH_R2only"
 CHUNK_DIR="${OUT_DIR}/chunks"
 TMP_DIR="${OUT_DIR}/tmp"
-PYTHON="/Users/newuser/Desktop/claude-code/0-Environment/miniforge3/envs/igblast-env/bin/python"
+PYTHON="${BCR_PIPELINE_PYTHON:-${ENV_PREFIX}/bin/python}"
 
-CHUNK_RAW_PAIRS=1500000   # 每塊處理的原始 raw read pairs 數量（demux前，~13.5M/1.5M≈9塊）
+CHUNK_RAW_PAIRS="${BCR_CHUNK_RAW_PAIRS:-1500000}"   # 每塊處理的原始 raw read pairs 數量（demux前，~13.5M/1.5M≈9塊）
 
 T7_TSO="CTAATACGACTCACTATAGGGCAAGCAGTGGTATCAACGCAGAGT"
 TSO="AAGCAGTGGTATCAACGCAGAGT"
@@ -55,6 +59,31 @@ warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 step()  { echo -e "\n${CYAN}━━━ $1 ━━━${NC}"; }
 count_reads() { echo $(( $(wc -l < "$1") / 4 )); }
+
+# 輸入檔指紋（檔名、大小、第一筆與最後一筆read名稱、chunk大小）。已經有 .done 標記但指紋不同，代表輸入換過，
+# 舊的 chunk 不能沿用。
+input_fingerprint() {
+    local f
+    for f in "$R1" "$R2"; do
+        printf '%s\t%s\t%s\t%s\n' "$(basename "$f")" "$(wc -c < "$f" | tr -d ' ')" "$(head -1 "$f")" "$(tail -n 4 "$f" | head -1)"
+    done
+    echo "CHUNK_RAW_PAIRS=${CHUNK_RAW_PAIRS}"
+}
+check_fingerprint() {
+    local fp_file="$1" now
+    now=$(input_fingerprint)
+    if [ -f "$fp_file" ]; then
+        [ "$(cat "$fp_file")" = "$now" ] || error "輸入檔或chunk設定跟上次不同（見 ${fp_file}）。若要重跑，請先移走 $(dirname "$fp_file") 底下舊的 chunks/ 與 chunk_stats.csv。"
+    else
+        echo "$now" > "$fp_file"
+    fi
+}
+# 取代 chunk_stats.csv 中同一個 chunk 的舊列（中斷後重跑不會重複計數）
+replace_stats_row() {
+    local stats="$1" idx="$2" line="$3"
+    { head -1 "$stats"; tail -n +2 "$stats" | grep -v "^${idx}," || true; echo "$line"; } > "${stats}.tmp"
+    mv "${stats}.tmp" "$stats"
+}
 rc_iupac() {
     "$PYTHON" -c "
 s = '$1'.upper()
@@ -70,6 +99,14 @@ step "環境確認"
 command -v cutadapt &>/dev/null || error "找不到 cutadapt（記得先 conda activate bcr_pipeline）"
 mkdir -p "$CHUNK_DIR" "$TMP_DIR"
 [ -f "${OUT_DIR}/chunk_stats.csv" ] || echo "chunk,raw_pairs,igh_demux,qc_trimmed" > "${OUT_DIR}/chunk_stats.csv"
+check_fingerprint "${OUT_DIR}/demux.input_fingerprint"
+# 已經完整跑完（有 demux.complete、輸入指紋相同）就整個跳過：IGL 會清掉 chunks/，若照 .done 判斷會整份重做，
+# 而重做又會讓下游以為上游更新了而跟著重跑。要強制重做請刪除 demux.complete。
+if [ -f "${OUT_DIR}"/demux.complete ]; then
+    info "demux 先前已完整完成（demux.complete），略過；若要重做請先刪除 demux.complete"
+    exit 0
+fi
+rm -f "${OUT_DIR}"/demux.complete   # 跑完全部 chunk 後才重新寫入；下游 igblast 步驟會檢查它
 
 TOTAL_LINES=$(wc -l < "$R1")
 TOTAL_PAIRS=$(( TOTAL_LINES / 4 ))
@@ -90,8 +127,8 @@ for (( i=0; i<NUM_CHUNKS; i++ )); do
     START_LINE=$(( i * CHUNK_RAW_PAIRS * 4 + 1 ))
     END_LINE=$(( (i+1) * CHUNK_RAW_PAIRS * 4 ))
 
-    sed -n "${START_LINE},${END_LINE}p" "$R1" > "${TMP_DIR}/raw_R1.fastq"
-    sed -n "${START_LINE},${END_LINE}p" "$R2" > "${TMP_DIR}/raw_R2.fastq"
+    sed -n "${START_LINE},${END_LINE}p;${END_LINE}q" "$R1" > "${TMP_DIR}/raw_R1.fastq"
+    sed -n "${START_LINE},${END_LINE}p;${END_LINE}q" "$R2" > "${TMP_DIR}/raw_R2.fastq"
     N_RAW=$(count_reads "${TMP_DIR}/raw_R1.fastq")
     if [ "$N_RAW" -eq 0 ]; then
         info "chunk ${IDX} 沒有資料（已到檔案結尾），結束"
@@ -134,14 +171,15 @@ for (( i=0; i<NUM_CHUNKS; i++ )); do
     awk 'NR%4==1{print ">"substr($0,2)} NR%4==2{print}' "${TMP_DIR}/trimmed.fastq" > "$OUT_FASTA"
     rm -f "${TMP_DIR}/trimmed.fastq"
 
-    echo "${IDX},${N_RAW},${N_IGH},${N_TRIM}" >> "${OUT_DIR}/chunk_stats.csv"
+    replace_stats_row "${OUT_DIR}/chunk_stats.csv" "$IDX" "${IDX},${N_RAW},${N_IGH},${N_TRIM}"
     touch "$DONE_MARK"
     info "  ✓ chunk ${IDX} 完成：${N_RAW} raw → ${N_IGH} IGH demux → ${N_TRIM} QC/trim 後"
 done
 
+date "+%Y-%m-%d %H:%M:%S" > "${OUT_DIR}"/demux.complete
 rmdir "$TMP_DIR" 2>/dev/null || true
 step "Demux + R2-only trim 完成"
-TOTAL_FASTA=$(cat "${CHUNK_DIR}"/chunk_*.fasta 2>/dev/null | grep -c "^>")
+TOTAL_FASTA=$(cat "${CHUNK_DIR}"/chunk_*.fasta 2>/dev/null | grep -c "^>" || true)
 N_CHUNKS_DONE=$(ls "${CHUNK_DIR}"/chunk_*.fasta 2>/dev/null | wc -l | tr -d ' ')
 info "Rabbit ${RABBIT} IGH R2-only 總計：${TOTAL_FASTA} 條序列，${N_CHUNKS_DONE} 個 chunk fasta"
 info "接下來執行：bash 02d_run_aviti_r2only_igblast.sh ${RABBIT}"

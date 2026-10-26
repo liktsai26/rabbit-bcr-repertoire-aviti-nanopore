@@ -18,15 +18,22 @@ underlying data.
 All analysis was run in a single conda environment to keep versions
 consistent across every step. See `docs/` for the full version record:
 
-- `docs/Software_and_Computational_Environment.docx` — Methods-ready paragraph + Table S1 (English)
+- `Software_and_Computational_Environment.docx` — Methods-ready paragraph + Table S1 (English)
+  (at the repository root in this revision, not under `docs/`)
 - `environment.yml` — machine-readable export (`conda env export --no-builds`), recreate with:
   ```
   conda env create -f environment.yml
   ```
+  > Review note (2026-10): this export does not solve as-is on macOS (osx-arm64:
+  > `sqlite=3.51.2` conflicts with `libsqlite>=3.52.0` required by `igblast=1.22.0`, and several
+  > `defaults`-channel builds are rejected under strict channel priority; osx-64: no
+  > `libffi=3.4.8`). It also lacks `chopper`, which the Nanopore scripts call. A minimal,
+  > solvable environment with the key pinned versions is in `tests/environment.test.yml`.
 
 Key tool versions used by the scripts in this folder (verified 2026-09-08,
 unchanged since first recorded 2026-08-03):
-Python 3.10.20 · cutadapt 5.2 · NanoFilt 2.8.0 · igblastn 1.22.0 (BLAST+ 2.16.0) ·
+Python 3.10.20 · cutadapt 5.2 · NanoFilt 2.8.0 (note: the Nanopore scripts actually call
+`chopper`, version not recorded) · igblastn 1.22.0 (BLAST+ 2.16.0) ·
 pandas 2.3.3 · numpy 2.2.6 · scipy 1.15.3 · matplotlib 3.10.9 · biopython 1.87 ·
 openpyxl 3.1.5. (`environment.yml` and the `docs/` version records describe
 the full analysis environment, including python-docx, which is used only by
@@ -68,16 +75,21 @@ export BCR_IGDATA=/path/to/your/conda/envs/bcr_pipeline/share/igblast
 bash 02_run_nanopore.sh
 ```
 
-**The AVITI upstream scripts below (IGH/IGK/IGL pipelines, `02c`–`04d`,
-`igblast_round_retry.py`, `run_igk_full_pipeline.sh`,
-`run_igl_full_pipeline.sh`) do not yet support this override — they resolve
-`BASE_DIR`/`IGDATA`/`PYTHON` etc. as hardcoded absolute paths at the top of
-each file.** They are included here so collaborators can review the exact
-analysis logic (demuxing, IgBLAST parameters, the coordinate-stitching
-method, and the round-based retry mechanism around a known `igblastn`
-1.22.0 bug — see inline comments in `igblast_round_retry.py`), not for a
-drop-in rerun on another machine. To actually execute them elsewhere, edit
-the hardcoded path variables near the top of each script first.
+The AVITI upstream scripts (IGH/IGK/IGL pipelines, `02c`–`04d`,
+`igblast_round_retry.py`, `run_igk_full_pipeline.sh`, `run_igl_full_pipeline.sh`)
+accept the same kind of overrides since the 2026-10 review; the defaults are
+still the original absolute paths, so behaviour on the original machine is unchanged:
+
+| Variable | Default | What it points to |
+|---|---|---|
+| `BCR_PIPELINE_ROOT` | `/Users/newuser/Desktop/claude-code/20260701-BCR_pipeline` | contains `samples/`, `reference/IMGT_reference_clean/`, `results/` |
+| `BCR_ENV_PREFIX` | `.../miniforge3/envs/igblast-env` | conda env prefix (`bin/python`, `bin/igblastn`, `share/igblast`) |
+| `BCR_PIPELINE_PYTHON`, `BCR_IGDATA`, `BCR_IGBLASTN` | derived from `BCR_ENV_PREFIX` | individual overrides |
+| `BCR_KEEP_CHUNKS` | `0` | `1` keeps IGL `chunks/` instead of deleting them after each rabbit |
+| `BCR_CHUNK_RAW_PAIRS`, `BCR_IGBLAST_BATCH`, `BCR_CHUNK_SIZE`, `BCR_BATCH_SIZE` | 1500000 / 25000 / 500000 / 25000 | chunk sizes (only changed by the tests) |
+
+`04b`/`04d` now call the `igblast_round_retry.py` that sits next to them (the
+original path `${BASE_DIR}/script/…` only existed on the original machine).
 
 ### Known limitation: gene order can vary between runs on tied values
 
@@ -92,6 +104,53 @@ only swaps the position of tied categories; it does not change any underlying
 value, count, or statistic. Not fixed in this release — noted here so it
 isn't mistaken for a data error if you regenerate the figure and a gene pair
 lands in a different order than the shipped PNG.
+
+## 2026-10 code review changes (summary)
+
+See `tests/README.md` for how each change was tested (public IMGT reference, real rabbit IgH
+sequences from OAS, simulated AVITI/Nanopore reads with known truth, bash 3.2).
+
+* **Stitching (`02g`/`04c` → shared `stitch_core.py`)**: germline coordinates of R1 and R2 are
+  only comparable when both reads were assigned the same V allele. When they differ (most IgH
+  pairs, e.g. IGHV1S40\*01 296 nt vs IGHV1S45\*01 299 nt) the cut point shifted by whole
+  codons, producing in-frame duplications/deletions that stay `productive=T`. The fix maps
+  coordinates between the two germline alleles, uses `v_cigar` for read indels, fixes the
+  1-based adjacency off-by-one, and checks the overlap at the predicted register instead of with
+  a shift-insensitive local alignment (exceptions now reject instead of pass).
+* **IgBLAST stages (`02d`/`02f`/`02h`/`04b`/`04d` → shared `igblast_chunk_lib.sh`)**: empty
+  chunks no longer abort; a non-zero igblastn exit is retried; interrupted sub-batch splits are
+  redone; unprocessable read IDs are kept in `<OUT_DIR>/irrecoverable/` and
+  `<sample>_irrecoverable_ids.txt`; final merges are written to a temp file, checked
+  (`rows + irrecoverable = input`) and marked with `<final>.complete`, which replaces the
+  "non-empty file means done" check.
+* **Demux (`02c`/`02e`/`04a`)**: `sed` stops at the chunk end, an input fingerprint stops reuse
+  of stale `.done` markers, `chunk_stats.csv` rows are replaced rather than appended on rerun,
+  empty R1 inserts are dropped, the final count no longer fails on zero reads.
+* **Entry points**: finished rabbits (all three `.complete` markers) are skipped, so a rerun after
+  the IGL clean-up no longer re-demuxes and re-stitches them; clean-up requires the markers.
+* **Nanopore**: `cutadapt -n 2` so both the TSO and the primer are removed when both are present
+  (the default removes only one adapter per read).
+
+### Using the fixed scripts on results produced by the old scripts
+
+Script names, arguments, output file names and `qc_stats.json` keys are unchanged. The new
+scripts, however, only trust results that carry a completion marker, so on an existing results
+folder do this once:
+
+```bash
+# 1. keep the old stitched results for comparison
+for d in "$BCR_PIPELINE_ROOT"/results/15651-LT-*_Aviti24/IG?_Stitched; do mv "$d" "${d}_old"; done
+# 2. mark the existing demux / R1-only / R2-only results as complete (only if you trust them)
+bash scripts/mark_existing_results_complete.sh --skip-stitched
+# 3. re-run only stitching + the third IgBLAST pass
+python scripts/02g_stitch_qc_igh.py 1 && bash scripts/02h_stitch_igblast.sh 1     # each rabbit
+bash scripts/run_igk_full_pipeline.sh && bash scripts/run_igl_full_pipeline.sh     # skips demux/R1/R2
+```
+
+Without step 2 the new stages stop with a message instead of trusting unmarked old files
+(`BCR_SKIP_UPSTREAM_CHECK=1` also bypasses the upstream check). To measure how much the stitching
+fix changes the existing data before re-running anything, use
+`tests/e2e/compare_stitch_methods.py R1only.airr.tsv R2only.airr.tsv IGHV.fasta`.
 
 ## Scripts
 
@@ -162,6 +221,10 @@ superseded by the coordinate-stitching pipeline above for all three loci
 since been deleted from the working directory.
 
 ### Shared library
+
+> Not included in this revision: `03_make_report.py`, `fig_utils.py` and all figure/table
+> scripts listed below were removed from the repository on 2026-10-19 (commit c8f81f9), and
+> `figures/` was removed as well. The tables are kept for reference.
 
 | Script | Purpose |
 |---|---|

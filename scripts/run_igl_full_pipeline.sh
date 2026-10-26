@@ -14,13 +14,28 @@
 # 當下這一隻」的量，不要累積到三隻份。
 #
 # 中斷後重跑：各步驟自身都有chunk/子批次層級的.done標記，會自動跳過已完成
-# 部分；但注意如果某隻兔子的chunks已經被清掉、該兔子理論上不會再被重跑
-# （04b/04d已有「最終檔案存在就跳過」的保護），所以中斷後重跑是安全的。
+# 部分；chunks 已被清掉的兔子由 rabbit_complete() 整隻跳過（2026-10 修正：原本只有
+# 04b/04d 會跳過，04a/04c 會把已完成的兔子重跑一遍）。清理前要求三份最終檔都有
+# .complete 完成標記；不可處理的read ID 與 chunk_stats.csv 都在 chunks/ 之外，不會被清掉。
+# 設 BCR_KEEP_CHUNKS=1 可保留 chunks/ 不清理。
 set -e
-SCRIPT_DIR="/Users/newuser/Desktop/claude-code/20260701-BCR_pipeline/script"
-RESULTS_DIR="/Users/newuser/Desktop/claude-code/20260701-BCR_pipeline/results"
-PYTHON="/Users/newuser/Desktop/claude-code/0-Environment/miniforge3/envs/igblast-env/bin/python"
+SCRIPT_DIR="${BCR_SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+
+BASE_DIR="${BCR_PIPELINE_ROOT:-/Users/newuser/Desktop/claude-code/20260701-BCR_pipeline}"
+RESULTS_DIR="${BASE_DIR}/results"
+PYTHON="${BCR_PIPELINE_PYTHON:-${BCR_ENV_PREFIX:-/Users/newuser/Desktop/claude-code/0-Environment/miniforge3/envs/igblast-env}/bin/python}"
 CHAIN="IGL"
+
+# 2026-10 code review：某隻兔子三份最終結果都有完成標記（.complete）就整隻跳過。原本只有
+# 04b/04d 會跳過，04a/04c 沒有保護，IGL 清掉 chunks/ 後重跑會把已完成的兔子重新 demux、
+# 重新拼接，chunk_stats.csv 也會重複追加。
+rabbit_complete() {
+    local base="${RESULTS_DIR}/15651-LT-$1_Aviti24" side
+    for side in R1only R2only Stitched; do
+        [ -f "${base}/${CHAIN}_${side}/15651-LT-$1_AVITI_${CHAIN}_${side}.airr.tsv.complete" ] || return 1
+    done
+    return 0
+}
 
 cleanup_rabbit_chunks() {
     local rabbit="$1"
@@ -29,9 +44,10 @@ cleanup_rabbit_chunks() {
 
     for side_dir in "${CHAIN}_R1only" "${CHAIN}_R2only" "${CHAIN}_Stitched"; do
         local final_airr
-        final_airr=$(ls "${base}/${side_dir}"/*.airr.tsv 2>/dev/null | head -1)
-        if [ -z "$final_airr" ] || [ ! -s "$final_airr" ]; then
-            echo "  !! 警告：${side_dir} 的最終合併檔不存在或是空檔，不會清理 chunks/（${base}/${side_dir}）"
+        final_airr="${base}/${side_dir}/15651-LT-${rabbit}_AVITI_${side_dir}.airr.tsv"
+        # 2026-10：只看「存在且非空」無法分辨中斷時寫到一半的檔案，改成要求完成標記
+        if [ ! -s "$final_airr" ] || [ ! -f "${final_airr}.complete" ]; then
+            echo "  !! 警告：${side_dir} 的最終合併檔不存在、是空檔或沒有完成標記，不會清理 chunks/（${base}/${side_dir}）"
             ok=0
         fi
     done
@@ -52,6 +68,10 @@ cleanup_rabbit_chunks() {
 }
 
 for RABBIT in 1 2 3; do
+    if rabbit_complete "$RABBIT"; then
+        echo "### Rabbit ${RABBIT} ${CHAIN} 三份最終結果都已完成（.complete），整隻跳過"
+        continue
+    fi
     echo ""
     echo "################################################################"
     echo "### Rabbit ${RABBIT} ${CHAIN} — Step1 demux 開始 $(date '+%Y-%m-%d %H:%M:%S')"
@@ -76,7 +96,11 @@ for RABBIT in 1 2 3; do
 
     echo ""
     echo "### Rabbit ${RABBIT} ${CHAIN} — 驗證最終檔案並清理chunks $(date '+%Y-%m-%d %H:%M:%S')"
-    cleanup_rabbit_chunks "$RABBIT"
+    if [ "${BCR_KEEP_CHUNKS:-0}" = "1" ]; then
+        echo "  BCR_KEEP_CHUNKS=1：保留 chunks/ 不清理"
+    else
+        cleanup_rabbit_chunks "$RABBIT"
+    fi
 
     echo "### Rabbit ${RABBIT} ${CHAIN} 全部完成 $(date '+%Y-%m-%d %H:%M:%S')"
 done
